@@ -22,6 +22,10 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 ALLOWED_GROUP_ID = int(os.getenv("ALLOWED_GROUP_ID", "0").strip())
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0").strip())
+
+# NEW: notifications go to this chat (your private channel where bot is admin)
+ADMIN_NOTIFY_CHAT_ID = int(os.getenv("ADMIN_NOTIFY_CHAT_ID", "0").strip())
+
 STATE_TIMEOUT_MIN = int(os.getenv("STATE_TIMEOUT_MIN", "20").strip())
 DATA_FILE = os.getenv("DATA_FILE", "recharges.json").strip()
 
@@ -31,6 +35,8 @@ if ALLOWED_GROUP_ID == 0:
     raise RuntimeError("Missing ALLOWED_GROUP_ID")
 if ADMIN_USER_ID == 0:
     raise RuntimeError("Missing ADMIN_USER_ID")
+if ADMIN_NOTIFY_CHAT_ID == 0:
+    raise RuntimeError("Missing ADMIN_NOTIFY_CHAT_ID")
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 
@@ -38,9 +44,12 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 # CONFIG
 # ======================
 ITALY_TZ_NAME = "Europe/Rome"
-OPEN_FROM = dtime(0, 0)
-OPEN_TO = dtime(23, 59)
 
+# PRODUCTION HOURS:
+OPEN_FROM = dtime(0, 0)
+OPEN_TO = dtime(23, 59.)
+
+# Steps
 STEP_IDLE = "idle"
 STEP_CHOOSE = "choose"
 STEP_ASK_CREDITS = "ask_credits"
@@ -144,6 +153,9 @@ def save_data():
         print("Failed to save data:", e)
 
 def member_of_group(user_id: int) -> bool:
+    """
+    Bot must be in the allowed group; better as admin.
+    """
     try:
         m = bot.get_chat_member(ALLOWED_GROUP_ID, user_id)
         return m.status in ("member", "administrator", "creator")
@@ -221,7 +233,7 @@ def get_last_records(user_id: int, n: int = 5) -> List[RechargeRecord]:
 load_data()
 
 # ======================
-# COMMANDS
+# COMMANDS (User)
 # ======================
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
@@ -274,7 +286,7 @@ def cmd_ricarica(message):
     bot.reply_to(message, "Perfetto ✅\nPremi il tasto qui sotto per iniziare:", reply_markup=kb_start())
 
 # ======================
-# ADMIN COMMANDS
+# COMMANDS (Admin)
 # ======================
 @bot.message_handler(commands=["history"])
 def cmd_history(message):
@@ -307,6 +319,10 @@ def cmd_history(message):
 
 @bot.message_handler(commands=["link"])
 def cmd_link(message):
+    """
+    Admin sends card payment link to customer:
+    /link <user_id> <url>
+    """
     if not is_private_chat(message):
         return
     if not is_admin(message.from_user.id):
@@ -344,285 +360,4 @@ def cmd_link(message):
 
     bot.reply_to(message, "✅ Link inviato al cliente.")
 
-@bot.message_handler(commands=["done"])
-def cmd_done(message):
-    if not is_private_chat(message):
-        return
-    if not is_admin(message.from_user.id):
-        return
-
-    parts = message.text.strip().split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        bot.reply_to(message, "Uso: <code>/done USER_ID</code>")
-        return
-
-    uid = int(parts[1])
-
-    try:
-        bot.send_message(uid, "✅ <b>Ricarica completata</b>\nGrazie! Se ti serve altro, scrivimi qui 👋")
-    except Exception as e:
-        bot.reply_to(message, f"Errore invio al cliente: {e}")
-        return
-
-    recs = history.get(uid, [])
-    for r in reversed(recs):
-        if r.status in ("pending", "link_sent"):
-            r.status = "completed"
-            save_data()
-            break
-
-    bot.reply_to(message, "✅ Cliente avvisato e richiesta marcata come completata.")
-
-# ======================
-# CALLBACKS
-# ======================
-@bot.callback_query_handler(func=lambda c: True)
-def callbacks(call):
-    uid = call.from_user.id
-    if call.message and call.message.chat.type != "private":
-        bot.answer_callback_query(call.id, "Aprimi in privato per continuare.")
-        return
-
-    st = ensure_state(uid)
-
-    def guard():
-        if not member_of_group(uid):
-            bot.answer_callback_query(call.id, "Accesso negato (non sei nel gruppo).")
-            return False
-        if not is_open_hours():
-            bot.answer_callback_query(call.id, "Fuori orario (10:00–23:00 Italia).")
-            return False
-        return True
-
-    data = call.data
-
-    if data == "start_recharge":
-        if not guard():
-            return
-        st.step = STEP_ASK_CREDITS
-        st.touch()
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, "Quanti <b>crediti</b> vuoi ricaricare? (scrivi solo il numero)")
-        return
-
-    if data in ("pay_carta", "pay_bitnovo"):
-        if not guard():
-            return
-        if st.step != STEP_CHOOSE_PAYMENT:
-            bot.answer_callback_query(call.id, "Procedura non valida. Usa /ricarica.")
-            return
-
-        st.payment = PAY_CARD if data == "pay_carta" else PAY_BITNOVO
-        st.step = STEP_ASK_PANEL
-        st.touch()
-
-        bot.answer_callback_query(call.id)
-        label = "Carta (link)" if st.payment == PAY_CARD else "Bitcoin / Bitnovo"
-        bot.send_message(call.message.chat.id, f"Hai scelto <b>{label}</b> ✅\n\nOra inserisci lo <b>username del tuo pannello</b>.")
-        return
-
-    if data in ("confirm_yes", "confirm_edit", "confirm_cancel"):
-        if not guard():
-            return
-        if st.step != STEP_CONFIRM:
-            bot.answer_callback_query(call.id, "Procedura non valida. Usa /ricarica.")
-            return
-
-        bot.answer_callback_query(call.id)
-
-        if data == "confirm_cancel":
-            reset_state(uid)
-            bot.send_message(call.message.chat.id, "❌ Procedura annullata. Quando vuoi riparti con <b>/ricarica</b>.")
-            return
-
-        if data == "confirm_edit":
-            st.step = STEP_ASK_CREDITS
-            st.credits = None
-            st.payment = None
-            st.panel_username = None
-            st.receipt_file_id = None
-            st.touch()
-            bot.send_message(call.message.chat.id, "Ok ✏️ Riscrivimi quanti <b>crediti</b> vuoi ricaricare (solo numero).")
-            return
-
-        # confermo
-        if st.payment == PAY_BITNOVO:
-            st.step = STEP_WAIT_RECEIPT
-            st.touch()
-            bot.send_message(
-                call.message.chat.id,
-                "Perfetto ✅\nAdesso <b>allega la foto dello scontrino Bitnovo</b> qui in chat."
-            )
-        else:
-            st.step = STEP_DONE
-            st.touch()
-            rec = create_record_from_state(st)
-            push_history(rec)
-            send_to_admin(rec)
-            bot.send_message(
-                call.message.chat.id,
-                "Perfetto ✅\nPer pagamento con <b>carta</b>: <b>aspetta</b> che genero io il link per pagare.\n\n"
-                "⏱️ <b>Entro 15 minuti</b> la ricarica viene effettuata."
-            )
-        return
-
-    bot.answer_callback_query(call.id, "Ok.")
-
-# ======================
-# TEXT ROUTER
-# ======================
-@bot.message_handler(content_types=["text"])
-def text_router(message):
-    uid = message.from_user.id
-    if not is_private_chat(message):
-        return
-
-    st = ensure_state(uid)
-    if st.step == STEP_IDLE:
-        return
-
-    if not member_of_group(uid):
-        bot.reply_to(message, "⛔ Accesso negato (solo membri del gruppo autorizzato).")
-        reset_state(uid)
-        return
-
-    if not is_open_hours():
-        now = italy_now().strftime("%H:%M")
-        bot.reply_to(message, f"⏳ Richieste chiuse ora. Ora Italia: <b>{now}</b> (10:00–23:00).")
-        reset_state(uid)
-        return
-
-    txt = (message.text or "").strip()
-
-    if st.step == STEP_ASK_CREDITS:
-        if not re.fullmatch(r"\d{1,6}", txt):
-            bot.reply_to(message, "Scrivi solo un numero (es: 10, 50, 100).")
-            return
-        credits = int(txt)
-        if credits <= 0:
-            bot.reply_to(message, "Inserisci un numero maggiore di 0.")
-            return
-
-        st.credits = credits
-        st.step = STEP_CHOOSE_PAYMENT
-        st.touch()
-
-        bot.reply_to(
-            message,
-            f"Ok ✅ Vuoi ricaricare: <b>{credits}</b> crediti.\n\nScegli il <b>metodo di pagamento</b>:",
-            reply_markup=kb_payments()
-        )
-        return
-
-    if st.step == STEP_ASK_PANEL:
-        if len(txt) < 3:
-            bot.reply_to(message, "Inserisci uno username valido del pannello.")
-            return
-
-        st.panel_username = txt
-        st.step = STEP_CONFIRM
-        st.touch()
-
-        bot.reply_to(message, format_summary(st) + "\nConfermi questi dati?", reply_markup=kb_confirm())
-        return
-
-    if st.step == STEP_WAIT_RECEIPT:
-        bot.reply_to(message, "📸 Sto aspettando la <b>foto dello scontrino Bitnovo</b>. Invia una foto qui.")
-        return
-
-    if st.step == STEP_DONE:
-        bot.reply_to(message, "✅ Richiesta già presa in carico. Se ti serve altro, scrivimi qui.")
-        return
-
-# ======================
-# PHOTO ROUTER
-# ======================
-@bot.message_handler(content_types=["photo"])
-def photo_router(message):
-    uid = message.from_user.id
-    if not is_private_chat(message):
-        return
-
-    st = ensure_state(uid)
-    if st.step != STEP_WAIT_RECEIPT:
-        return
-
-    if not member_of_group(uid):
-        bot.reply_to(message, "⛔ Accesso negato (solo membri del gruppo autorizzato).")
-        reset_state(uid)
-        return
-
-    if not is_open_hours():
-        bot.reply_to(message, "⏳ Fuori orario (10:00–23:00 Italia). Riprova domani.")
-        reset_state(uid)
-        return
-
-    file_id = message.photo[-1].file_id
-    st.receipt_file_id = file_id
-    st.step = STEP_DONE
-    st.touch()
-
-    rec = create_record_from_state(st)
-    push_history(rec)
-    send_to_admin(rec)
-
-    bot.reply_to(
-        message,
-        "Ricevuto ✅\nGrazie! Procedo con la verifica.\n⏱️ <b>Entro 15 minuti</b> la ricarica viene effettuata.\nA presto 👋"
-    )
-
-# ======================
-# RECORD + ADMIN SEND
-# ======================
-def create_record_from_state(st: RechargeState) -> RechargeRecord:
-    rec_id = new_record_id(st.user_id or 0)
-    created = italy_now().isoformat()
-    return RechargeRecord(
-        record_id=rec_id,
-        created_at_iso=created,
-        user_id=st.user_id or 0,
-        username=st.user_name or f"user_id {st.user_id}",
-        credits=st.credits or 0,
-        payment=st.payment or "",
-        panel_username=st.panel_username or "",
-        receipt_file_id=st.receipt_file_id,
-        status="pending",
-    )
-
-def send_to_admin(rec: RechargeRecord):
-    pay_label = "Carta (link)" if rec.payment == PAY_CARD else "Bitcoin / Bitnovo"
-    text = (
-        "🧾 <b>NUOVA RICARICA</b>\n\n"
-        f"🆔 Record: <code>{rec.record_id}</code>\n"
-        f"🕒 Italia: <b>{rec.created_at_iso.split('T')[0]} {rec.created_at_iso.split('T')[1][:5]}</b>\n"
-        f"👤 Utente: <b>{rec.username}</b>\n"
-        f"🔢 Crediti: <b>{rec.credits}</b>\n"
-        f"💳 Metodo: <b>{pay_label}</b>\n"
-        f"🧩 Pannello: <code>{rec.panel_username}</code>\n"
-        f"👤 user_id: <code>{rec.user_id}</code>\n"
-    )
-
-    if rec.payment == PAY_CARD:
-        text += (
-            "\n➡️ <b>Azione:</b> genera link carta e invialo al cliente:\n"
-            f"<code>/link {rec.user_id} https://...</code>\n"
-            "Quando completata:\n"
-            f"<code>/done {rec.user_id}</code>"
-        )
-        bot.send_message(ADMIN_USER_ID, text)
-        return
-
-    text += "\n➡️ <b>Azione:</b> verifica scontrino Bitnovo e ricarica.\n"
-    text += f"Quando completata:\n<code>/done {rec.user_id}</code>"
-
-    if rec.receipt_file_id:
-        bot.send_photo(ADMIN_USER_ID, rec.receipt_file_id, caption=text)
-    else:
-        bot.send_message(ADMIN_USER_ID, text + "\n⚠️ Ricevuta NON allegata.")
-
-# ======================
-# RUN
-# ======================
-if __name__ == "__main__":
-    print("Bot running...")
-    bot.infinity_polling(skip_pending=True)
+@bot.m
