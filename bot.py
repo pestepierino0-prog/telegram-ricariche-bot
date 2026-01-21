@@ -39,7 +39,7 @@ bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 # ======================
 ITALY_TZ_NAME = "Europe/Rome"
 OPEN_FROM = dtime(10, 0)
-OPEN_TO = dtime(23, 0)
+OPEN_TO = dtime(23, 59)
 
 STEP_IDLE = "idle"
 STEP_CHOOSE = "choose"
