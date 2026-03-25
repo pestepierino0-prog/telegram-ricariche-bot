@@ -530,7 +530,7 @@ def flow_callbacks(call):
             bot.send_message(
                 call.message.chat.id,
                 "Perfetto ✅\nOra scrivi i <b>codici Bitnovo</b> qui in chat.\n\n"
-                "Se hai più codici, scrivili <b>uno sotto l’altro</b> oppure tutti nello stesso messaggio."
+                "Se hai più codici, scrivili tutti nello stesso messaggio."
             )
             return
 
